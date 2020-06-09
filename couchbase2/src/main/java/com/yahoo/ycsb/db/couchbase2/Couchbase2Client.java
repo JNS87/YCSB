@@ -133,6 +133,8 @@ public class Couchbase2Client extends DB {
   private int runtimeMetricsInterval;
   private String scanAllQuery;
   private int documentExpiry;
+  private Boolean flexQuery;
+  
   
   @Override
   public void init() throws DBException {
@@ -158,6 +160,8 @@ public class Couchbase2Client extends DB {
     documentExpiry = Integer.parseInt(props.getProperty("couchbase.documentExpiry", "0"));
     scanAllQuery =  "SELECT RAW meta().id FROM `" + bucketName +
       "` WHERE meta().id >= $1 ORDER BY meta().id LIMIT $2";
+    flexQuery = Boolean.parseBoolean(props.getProperty("couchbase.flexQuery","false")) ;
+   
 
     try {
       synchronized (INIT_COORDINATOR) {
@@ -239,6 +243,7 @@ public class Couchbase2Client extends DB {
     sb.append(", boost=").append(boost);
     sb.append(", networkMetricsInterval=").append(networkMetricsInterval);
     sb.append(", runtimeMetricsInterval=").append(runtimeMetricsInterval);
+    sb.append(", flexQuery=").append(flexQuery);
 
     LOGGER.info("===> Using Params: " + sb.toString());
   }
@@ -289,7 +294,15 @@ public class Couchbase2Client extends DB {
    */
   private Status readN1ql(final String docId, Set<String> fields, final Map<String, ByteIterator> result)
     throws Exception {
-    String readQuery = "SELECT " + joinFields(fields) + " FROM `" + bucketName + "` USE KEYS [$1]";
+	  String readQuery = "SELECT " + joinFields(fields) + " FROM `" + bucketName + "` USE INDEX ("+"USING FTS)";
+	switch(flexQuery)
+	{
+	case 0:
+		
+		readQuery= " address.ecpdId='1' ORDER BY META().id LIMIT 100";
+		break;
+	}
+    
     N1qlQueryResult queryResult = bucket.query(N1qlQuery.parameterized(
         readQuery,
         JsonArray.from(docId),
@@ -589,11 +602,24 @@ public class Couchbase2Client extends DB {
   public Status scan(final String table, final String startkey, final int recordcount, final Set<String> fields,
       final Vector<HashMap<String, ByteIterator>> result) {
     try {
-      if (fields == null || fields.isEmpty()) {
-        return scanAllFields(table, startkey, recordcount, result);
-      } else {
-        return scanSpecificFields(table, startkey, recordcount, fields, result);
-      }
+    	if(flexQuery)
+    	{
+  		  //final String table, final String startkey,final int recordcount, final int choice,
+  		  //final Set<String>fields, final Vector<HashMap<String,ByteIterator>> result
+    		final int choice = 1;
+  		  return scanN1FTY(table,startkey,recordcount,choice,fields,result);
+    	}
+    	else
+    	{
+    		 if (fields == null || fields.isEmpty()) {
+    		        return scanAllFields(table, startkey, recordcount, result);
+    		      } 
+    		  else {
+    		    	  
+    		    	  return scanSpecificFields(table, startkey, recordcount, fields, result);
+    		      }
+    	}
+     
     } catch (Exception ex) {
       ex.printStackTrace();
       return Status.ERROR;
@@ -684,11 +710,6 @@ public class Couchbase2Client extends DB {
         N1qlParams.build().adhoc(adhoc).maxParallelism(maxParallelism)
     ));
 
-    if (!queryResult.parseSuccess() || !queryResult.finalSuccess()) {
-      throw new RuntimeException("Error while parsing N1QL Result. Query: " + scanSpecQuery
-        + ", Errors: " + queryResult.errors());
-    }
-
     boolean allFields = fields == null || fields.isEmpty();
     result.ensureCapacity(recordcount);
 
@@ -705,6 +726,49 @@ public class Couchbase2Client extends DB {
       result.add(tuple);
     }
     return Status.OK;
+  }
+  
+  private Status scanN1FTY(final String table, final String startkey,final int recordcount, final int choice,
+		  final Set<String>fields, final Vector<HashMap<String,ByteIterator>> result)
+  {
+	  String scanSpecQuery = "SELECT"+joinFields(fields)+ "FROM `"+bucketName
+			  +"` USE INDEX (USING FTS) WHERE ";
+	  JsonArray parameters = JsonArray.create() ;
+	  switch(choice)
+	  {
+	  case 1 :
+		  scanSpecQuery = scanSpecQuery + "(((ANY c IN children SATISFIES c.gender = {1} END) OR (ANY c in children SATISFIES (c.age >={2} AND c.age<={3}) END ) ) "
+		  		+ "AND ((ANY num in devices SATISFIES num>= {4}  AND num<={5} END) OR (ANY c in children SATISFIES "
+		  		+ "(c.first_name >={6} AND c.first_name <={7}) END))) OR (ANY c IN children SATISFIES c.gender = {8} AND (c.age >= {9} AND c.age <= {10}) END ) ;";
+		  
+		  parameters = JsonArray.from("F",5,8,"060000-040","060000-080","A","Ab","F",3,9);
+		  break;
+	  }
+	  
+	  
+	  N1qlQueryResult queryResult = bucket.query(N1qlQuery.parameterized(
+		        scanSpecQuery,
+		        parameters,
+		        N1qlParams.build().adhoc(adhoc).maxParallelism(maxParallelism)
+		    ));
+	  
+	  boolean allFields = fields == null || fields.isEmpty();
+	    result.ensureCapacity(recordcount);
+	    
+	  for (N1qlQueryRow row : queryResult) {
+	      JsonObject value = row.value();
+	      if (fields == null) {
+	        value = value.getObject(bucketName);
+	      }
+	      Set<String> f = allFields ? value.getNames() : fields;
+	      HashMap<String, ByteIterator> tuple = new HashMap<String, ByteIterator>(f.size());
+	      for (String field : f) {
+	        tuple.put(field, new StringByteIterator(value.getString(field)));
+	      }
+	      result.add(tuple);
+	    }
+	  return Status.OK;
+
   }
 
   /**
